@@ -1,0 +1,3 @@
+<Project>
+  <!-- This xUnit host owns its temporary PKI. Do not import the MSTest store-cleanup fixture. -->
+</Project>
