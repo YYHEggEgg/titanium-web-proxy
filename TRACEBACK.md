@@ -43,7 +43,9 @@ The existing upstream integration project builds additional test dependencies; t
 
 Untouched stable characterization: 6 passed / 9 failed in the corrected standalone fixture (15 cases);
 platform proxy/lifecycle characterization: 23 passed / 21 failed (44 cases).
-Final local verification: 49/49 standalone regressions, 6/6 selected upstream core units, and 17/17 selected upstream HTTP/2 wire tests.
+Final local verification: 51/51 standalone regressions, 6/6 selected upstream core units, and 17/17 selected upstream HTTP/2 wire tests.
+The 5 MB streaming cases cover all four H1/H2 pairs, including the direct H2 path.
+The exclusive-bind fixture disables cooperative socket reuse on Linux.
 These are local protocol tests, not production UGC/CDN acceptance. Platform evidence and final results live in
 `docs/agents/titanium-fork-maintenance.md` in the consuming repository.
 
