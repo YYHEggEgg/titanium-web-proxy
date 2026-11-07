@@ -231,12 +231,11 @@ public partial class ProxyServer
         Channel<(byte[] Buffer, int Length)>? requestBodyChannel = null;
         if (sessionArgs.HttpClient.Request.HasBody && !sessionArgs.HttpClient.Request.IsBodyRead)
         {
-            requestBodyChannel = Channel.CreateBounded<(byte[] Buffer, int Length)>(
-                new BoundedChannelOptions(256)
+            requestBodyChannel = Channel.CreateUnbounded<(byte[] Buffer, int Length)>(
+                new UnboundedChannelOptions
                 {
                     SingleReader = true,
-                    SingleWriter = true,
-                    FullMode = BoundedChannelFullMode.Wait
+                    SingleWriter = true
                 });
         }
 
@@ -252,7 +251,9 @@ public partial class ProxyServer
         // "Received an HTTP/2 pseudo-header as a trailing header" under load).
         streamState.IsExternalBridge = true;
         streamState.InboundRequestBodyChannel = requestBodyChannel;
-
+        // Stream WINDOW_UPDATE follows origin consumption, not frame receipt. The stream window
+        // bounds queued bytes even when the client sends tiny DATA frames; other streams keep running.
+        streamState.DeferRequestBodyReceiveCredit = requestBodyChannel != null;
 
         // IsFastPath: no ContinueWith fault wrapper (catch inside the round trip already reports).
         // Saves one Task + continuation alloc per multiplexed GET under H2→H1 MITM.
@@ -590,7 +591,9 @@ public partial class ProxyServer
                                 if (HasOnRequestBodyWriteSubscribers && !sessionArgs.IsFastPath)
                                     await bodyWriter.WriteAsync(await ObservedBodyWriteStream.ObserveAsync(sessionArgs, true, bodyPiece, false), cancellationToken);
                                 else await bodyWriter.WriteAsync(bodyPiece, cancellationToken);
-
+                                if (connectionState.Streams.TryGetValue(streamId, out var receivingState)
+                                    && receivingState.RequestBodyConsumed is { } consumed)
+                                    await consumed(chunk.Length);
                             }
                         }
                         finally

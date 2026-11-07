@@ -151,6 +151,8 @@ public sealed class CoreRegressionTests
         var payload = Enumerable.Range(0, large ? 5_000_000 : 48_017).Select(i => (byte)(i % 251)).ToArray();
         origin.Run(async context =>
         {
+            // Fill the receive window before the H1 origin starts consuming the upload.
+            if (large && originVersion == 1) await Task.Delay(400, context.RequestAborted);
             using var body = new MemoryStream();
             await context.Request.Body.CopyToAsync(body, context.RequestAborted);
             received.Add(body.ToArray());

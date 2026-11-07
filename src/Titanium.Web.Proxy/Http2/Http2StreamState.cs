@@ -156,6 +156,9 @@ internal sealed class Http2StreamState
     ///     buffer; the bridge reader must <c>ArrayPool&lt;byte&gt;.Return</c> after writing to the origin.
     /// </summary>
     internal Channel<(byte[] Buffer, int Length)>? InboundRequestBodyChannel { get; set; }
+    internal bool DeferRequestBodyReceiveCredit { get; set; }
+    internal int QueuedRequestBodyBytes;
+    internal Func<int, ValueTask>? RequestBodyConsumed { get; set; }
 
     /// <summary>
     ///     Completes when the queued origin HEADERS write for this stream has finished (or failed).
@@ -234,6 +237,9 @@ internal sealed class Http2StreamState
         ExtendedConnectEstablished = false;
         InboundTunnelChannel = null;
         InboundRequestBodyChannel = null;
+        DeferRequestBodyReceiveCredit = false;
+        QueuedRequestBodyBytes = 0;
+        RequestBodyConsumed = null;
         OriginHeadersFlushed = null;
         IsExternalBridge = false;
         CapturedCompressedHeaders = null;

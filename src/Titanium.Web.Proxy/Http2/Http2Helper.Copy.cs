@@ -210,7 +210,8 @@ namespace Titanium.Web.Proxy.Http2
             // SETTINGS-completion flush runs on a continuation thread; gate pending mutations.
             var receiveCreditGate = new object();
 
-            ValueTask GrantReceiveCreditAsync(int streamId, int bytes, bool forceFlush = false)
+            ValueTask GrantReceiveCreditAsync(int streamId, int bytes, bool forceFlush = false,
+                bool connectionCredit = true, bool streamCredit = true)
             {
                 if (bytes <= 0 && !forceFlush) return default;
 
@@ -220,11 +221,14 @@ namespace Titanium.Web.Proxy.Http2
                 {
                     if (bytes > 0)
                     {
-                        pendingConnectionReceiveCredit += bytes;
-                        if (pendingStreamReceiveCredit.TryGetValue(streamId, out var streamPending))
-                            pendingStreamReceiveCredit[streamId] = streamPending + bytes;
-                        else
-                            pendingStreamReceiveCredit[streamId] = bytes;
+                        if (connectionCredit) pendingConnectionReceiveCredit += bytes;
+                        if (streamCredit)
+                        {
+                            if (pendingStreamReceiveCredit.TryGetValue(streamId, out var streamPending))
+                                pendingStreamReceiveCredit[streamId] = streamPending + bytes;
+                            else
+                                pendingStreamReceiveCredit[streamId] = bytes;
+                        }
                     }
 
                     // Client→proxy DATA can try to flush WINDOW_UPDATE toward the client before the
@@ -240,8 +244,8 @@ namespace Titanium.Web.Proxy.Http2
 
                     var flushConnection = forceFlush || pendingConnectionReceiveCredit >= ReceiveCreditBatchThreshold;
                     var flushStream = forceFlush
-                        || (pendingStreamReceiveCredit.TryGetValue(streamId, out var streamCredit)
-                            && streamCredit >= ReceiveCreditBatchThreshold);
+                        || (pendingStreamReceiveCredit.TryGetValue(streamId, out var pendingCredit)
+                            && pendingCredit >= ReceiveCreditBatchThreshold);
 
                     if (!flushConnection && !flushStream)
                         return default;
@@ -1357,7 +1361,10 @@ namespace Titanium.Web.Proxy.Http2
                     if (type == Http2FrameType.Data)
                     {
                         bool dataEndStream = (flags & Http2FrameFlag.EndStream) != 0;
-                        await GrantReceiveCreditAsync(streamId, length, forceFlush: dataEndStream);
+                        connectionState.Streams.TryGetValue(streamId, out var receivingBridge);
+                        var deferCredit = receivingBridge?.DeferRequestBodyReceiveCredit == true;
+                        await GrantReceiveCreditAsync(streamId, length, forceFlush: dataEndStream,
+                            streamCredit: !deferCredit);
 
                         // A synthetic extended CONNECT (CONNECT-UDP) is registered in syntheticStreams
                         // because RespondStreaming cancels the request. Its capsules live on
@@ -1401,9 +1408,21 @@ namespace Titanium.Web.Proxy.Http2
                             {
                                 var rented = ArrayPool<byte>.Shared.Rent(dataLen);
                                 Buffer.BlockCopy(buffer, dataOff, rented, 0, dataLen);
-                                // TryWrite only — never await on the frame loop (HOL for every stream
-                                // on this connection). Bound is large; full means the origin pump stalled.
-                                if (!synthState.InboundRequestBodyChannel.Writer.TryWrite((rented, dataLen)))
+                                if (deferCredit && synthState.RequestBodyConsumed == null)
+                                {
+                                    var consumedStreamId = streamId;
+                                    synthState.RequestBodyConsumed = bytes =>
+                                    {
+                                        Interlocked.Add(ref synthState.QueuedRequestBodyBytes, -bytes);
+                                        return GrantReceiveCreditAsync(consumedStreamId, bytes, forceFlush: true,
+                                            connectionCredit: false);
+                                    };
+                                }
+                                // Never await the consumer on the frame loop. Withhold stream credit until
+                                // origin consumption and reject peers exceeding the advertised receive window.
+                                var overflow = deferCredit && Interlocked.Add(ref synthState.QueuedRequestBodyBytes, dataLen)
+                                    > ClientInitialStreamWindowSize;
+                                if (overflow || !synthState.InboundRequestBodyChannel.Writer.TryWrite((rented, dataLen)))
                                 {
                                     ArrayPool<byte>.Shared.Return(rented);
                                     ReportException(logger, new ProxyHttpException(
@@ -1417,6 +1436,9 @@ namespace Titanium.Web.Proxy.Http2
                                 }
                             }
 
+                            if (deferCredit && length > dataLen)
+                                await GrantReceiveCreditAsync(streamId, length - dataLen, forceFlush: dataEndStream,
+                                    connectionCredit: false);
                             if (dataEndStream)
                             {
                                 endStream = true;
