@@ -645,6 +645,14 @@ internal sealed class Http2OriginConnection : IDisposable
                 try
                 {
                     await bodyPipe.CopyToAsync(dest, ct);
+                    // H2 trailers arrive after the DATA that started this response. Publish them
+                    // before the H1 bridge writes its chunked terminator, not at header delivery.
+                    if (pending.TrailingHeaders != null)
+                    {
+                        response.TrailingHeaders.Clear();
+                        foreach (var header in pending.TrailingHeaders)
+                            response.TrailingHeaders.AddHeader(header);
+                    }
                 }
                 finally
                 {

@@ -911,6 +911,13 @@ public partial class ProxyServer
             if (!ClientCannotReceiveChunked(args)) response.IsChunked = true;
             else response.Headers.AddHeader(KnownHeaders.Connection, "close");
         }
+        // Buffered origin exchanges keep bytes on the exchange for the fast path. BeforeResponse
+        // GetResponseBody must nevertheless see those bytes and enforce the explicit read budget.
+        if (response.IsBodyRead && !response.BodyAvailable)
+        {
+            response.Body = exchange.Body;
+            response.BodyIsWireEncoded = true;
+        }
         Http1FramingValidator.Validate(response, FramingSource.SynthesizedFromH2);
         response.SetOriginalHeaders();
         args.HttpClient.Response = response;

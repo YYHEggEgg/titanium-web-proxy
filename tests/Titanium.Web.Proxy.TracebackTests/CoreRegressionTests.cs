@@ -1,4 +1,5 @@
 using System.Collections.Concurrent;
+using System.IO.Compression;
 using System.Net;
 using System.Net.Security;
 using System.Net.Sockets;
@@ -135,7 +136,24 @@ public sealed class CoreRegressionTests
     [InlineData(2, 2, false)]
     [InlineData(1, 2, true)]
     [InlineData(2, 1, true)]
-    public async Task StreamingHooksMatchForwardedBodies(int clientVersion, int originVersion, bool large)
+    public Task StreamingHooksMatchForwardedBodies(int clientVersion, int originVersion, bool large) =>
+        RunStreamingHooksAsync(clientVersion, originVersion, large, "unknown");
+
+    [Theory]
+    [InlineData(1, 1, "known")]
+    [InlineData(1, 2, "known")]
+    [InlineData(2, 1, "known")]
+    [InlineData(2, 2, "known")]
+    [InlineData(1, 1, "gzip")]
+    [InlineData(1, 2, "gzip")]
+    [InlineData(2, 1, "gzip")]
+    [InlineData(2, 2, "gzip")]
+    [InlineData(1, 2, "trailers")]
+    [InlineData(2, 2, "trailers")]
+    public Task KnownCompressedAndTrailerBodiesKeepWireObservations(int clientVersion, int originVersion, string mode) =>
+        RunStreamingHooksAsync(clientVersion, originVersion, false, mode);
+
+    private static async Task RunStreamingHooksAsync(int clientVersion, int originVersion, bool large, string mode)
     {
         using var root = Certificate(true);
         using var certificate = Certificate(false);
@@ -149,15 +167,25 @@ public sealed class CoreRegressionTests
         await using var origin = builder.Build();
         var received = new ConcurrentBag<byte[]>();
         var payload = Enumerable.Range(0, large ? 5_000_000 : 48_017).Select(i => (byte)(i % 251)).ToArray();
+        if (mode == "gzip")
+        {
+            using var encoded = new MemoryStream();
+            using (var gzip = new GZipStream(encoded, CompressionLevel.Fastest, true)) gzip.Write(payload);
+            payload = encoded.ToArray();
+        }
         origin.Run(async context =>
         {
-            // Fill the receive window before the H1 origin starts consuming the upload.
+            // Give the H2 client enough time to fill the receive window before the H1 origin consumes.
             if (large && originVersion == 1) await Task.Delay(400, context.RequestAborted);
+            if (mode == "known") context.Response.ContentLength = payload.Length;
+            if (mode == "gzip") context.Response.Headers.ContentEncoding = "gzip";
+            if (mode == "trailers") context.Response.DeclareTrailer("x-checksum");
             using var body = new MemoryStream();
             await context.Request.Body.CopyToAsync(body, context.RequestAborted);
             received.Add(body.ToArray());
             for (var offset = 0; offset < payload.Length; offset += 8193)
                 await context.Response.Body.WriteAsync(payload.AsMemory(offset, Math.Min(8193, payload.Length - offset)), context.RequestAborted);
+            if (mode == "trailers") context.Response.AppendTrailer("x-checksum", "complete");
         });
         await origin.StartAsync(Token);
         using var proxy = Proxy(root);
@@ -208,12 +236,14 @@ public sealed class CoreRegressionTests
                 {
                     Version = clientVersion == 2 ? HttpVersion.Version20 : HttpVersion.Version11,
                     VersionPolicy = HttpVersionPolicy.RequestVersionExact,
-                    Content = new UnknownLengthContent(payload)
+                    Content = mode == "known" ? new ByteArrayContent(payload) : new UnknownLengthContent(payload)
                 };
+                if (mode == "gzip") request.Content.Headers.ContentEncoding.Add("gzip");
                 using var response = await client.SendAsync(request, Token);
                 Assert.Equal(HttpStatusCode.OK, response.StatusCode);
                 Assert.Equal(clientVersion, response.Version.Major);
                 Assert.Equal(payload, await response.Content.ReadAsByteArrayAsync(Token));
+                if (mode == "trailers") Assert.Equal("complete", Assert.Single(response.TrailingHeaders.GetValues("x-checksum")));
             }));
             await proxy.StopAsync(TimeSpan.FromSeconds(5));
             Assert.Equal(count, completed.Count);
@@ -380,6 +410,18 @@ public sealed class CoreRegressionTests
         var failure = await Record.ExceptionAsync(async () => await limited.CopyToAsync(Stream.Null, Token));
         Assert.NotNull(failure);
         Assert.IsNotType<TimeoutException>(failure);
+    }
+
+    [Fact]
+    public async Task CompleteChunkedTrailersRemainValid()
+    {
+        using var proxy = new ProxyServer(false, false, false);
+        using var input = new MemoryStream(Encoding.ASCII.GetBytes("3\r\nabc\r\n0\r\nX-Check: yes\r\n\r\n"));
+        using var reader = HttpReader(proxy, input);
+        using var limited = Limited(proxy, reader, true, -1);
+        using var actual = new MemoryStream();
+        await limited.CopyToAsync(actual, Token);
+        Assert.Equal("abc", Encoding.ASCII.GetString(actual.ToArray()));
     }
 
     [Fact]

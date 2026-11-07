@@ -480,6 +480,8 @@ public class SessionEventArgs : SessionEventArgsBase
             await ReadHttp2ResponseBodyAsync(response).ConfigureAwait(false);
         else if (response.Http3RawBodyDrain != null)
             await ReadHttp3ResponseBodyAsync(response, cancellationToken).ConfigureAwait(false);
+        else if (response.StreamBodyWriter != null && !HttpClient.HasConnection)
+            await ReadStreamedBridgeBodyAsync(response, cancellationToken).ConfigureAwait(false);
         else
             await ReadHttp1ResponseBodyAsync(response, cancellationToken).ConfigureAwait(false);
     }
@@ -511,6 +513,21 @@ public class SessionEventArgs : SessionEventArgsBase
         response.BodyIsWireEncoded = true;
         response.ContentLength = bodyBytes.Length;
         response.Headers.RemoveHeader(KnownHeaders.TransferEncoding);
+        response.StreamBodyWriter = null;
+        MarkResponseBodyRead(response);
+    }
+
+    private async Task ReadStreamedBridgeBodyAsync(Response response, CancellationToken cancellationToken)
+    {
+        using var buffered = new MemoryStream();
+        var limit = MaxBufferedBodyBytes ?? Server.MaxBufferedBodyBytes;
+        Stream target = limit > 0
+            ? new BoundedWriteStream(buffered, limit, Server.PolicyModes[PolicyFamily.BodyBudget])
+            : buffered;
+        await response.StreamBodyWriter!(target, cancellationToken).ConfigureAwait(false);
+        response.Body = buffered.ToArray();
+        response.BodyIsWireEncoded = true;
+        response.ContentLength = response.Body.Length;
         response.StreamBodyWriter = null;
         MarkResponseBodyRead(response);
     }
@@ -731,7 +748,9 @@ public class SessionEventArgs : SessionEventArgsBase
     {
         if (!HttpClient.Request.IsBodyRead)
             await ReadRequestBodyAsync(cancellationToken);
+        ValidateBufferedBody(HttpClient.Request);
         await EnsurePlainBodyAsync(HttpClient.Request, cancellationToken);
+        ValidateBufferedBody(HttpClient.Request);
         return HttpClient.Request.Body;
     }
 
@@ -780,7 +799,9 @@ public class SessionEventArgs : SessionEventArgsBase
     {
         if (!HttpClient.Response.IsBodyRead)
             await ReadResponseBodyAsync(cancellationToken);
+        ValidateBufferedBody(HttpClient.Response);
         await EnsurePlainBodyAsync(HttpClient.Response, cancellationToken);
+        ValidateBufferedBody(HttpClient.Response);
         return HttpClient.Response.Body;
     }
 
@@ -799,7 +820,15 @@ public class SessionEventArgs : SessionEventArgsBase
     ///     When eager-buffer left wire bytes in <see cref="RequestResponseBase.Body"/>, decompress once
     ///     so handlers see the same plain body as H1/H2 Get*Body (and Set*Body can re-encode safely).
     /// </summary>
-    private static async Task EnsurePlainBodyAsync(RequestResponseBase rr, CancellationToken cancellationToken)
+    private void ValidateBufferedBody(RequestResponseBase message)
+    {
+        var limit = MaxBufferedBodyBytes ?? Server.MaxBufferedBodyBytes;
+        if (limit > 0 && message.BodyAvailable && message.Body.Length > limit
+            && Server.PolicyModes[PolicyFamily.BodyBudget] == PolicyMode.Enforce)
+            throw new BodySizeLimitExceededException($"Buffered body exceeds the configured limit of {limit} bytes.");
+    }
+
+    private async Task EnsurePlainBodyAsync(RequestResponseBase rr, CancellationToken cancellationToken)
     {
         if (!rr.BodyIsWireEncoded || rr.ContentEncoding == null || !rr.BodyAvailable)
             return;
@@ -812,7 +841,9 @@ public class SessionEventArgs : SessionEventArgsBase
                 return; // unsupported (dcb/dcz/…) — leave wire bytes
 
             using var ms = new MemoryStream();
-            await decompressStream.CopyToAsync(ms, cancellationToken);
+            var limit = MaxBufferedBodyBytes ?? Server.MaxBufferedBodyBytes;
+            Stream target = limit > 0 ? new BoundedWriteStream(ms, limit, Server.PolicyModes[PolicyFamily.BodyBudget]) : ms;
+            await decompressStream.CopyToAsync(target, cancellationToken);
             rr.Body = ms.ToArray(); // clears BodyIsWireEncoded via setter
         }
         finally

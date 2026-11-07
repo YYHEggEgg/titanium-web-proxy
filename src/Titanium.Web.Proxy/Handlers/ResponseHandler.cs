@@ -267,6 +267,9 @@ public partial class ProxyServer
         await clientStream.WriteResponseAsync(response, cancellationToken);
         args.IsClientResponseCommitted = true;
 
+        if (!response.OriginalHasBody && !args.IsFastPath && ShouldCallBeforeResponseBodyWrite())
+            await OnBeforeResponseBodyWrite(new BeforeBodyWriteEventArgs(args, Array.Empty<byte>(), false, true));
+
         if (response.OriginalHasBody)
         {
             if (response.IsBodySent)
