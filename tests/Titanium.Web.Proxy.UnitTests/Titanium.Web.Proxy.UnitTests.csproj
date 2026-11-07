@@ -8,6 +8,8 @@
   </PropertyGroup>
 
   <ItemGroup>
+    <!-- The upstream store fixture scrubs real certificates; exclude its dependent tests in isolated runs. -->
+    <Compile Remove="CertificateStoreWriteSuppressionTests.cs" Condition="'$(IsTestHost)' == 'false'" />
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
     <PackageReference Include="MSTest.TestAdapter" Version="3.9.3" />
     <PackageReference Include="MSTest.TestFramework" Version="3.9.3" />
