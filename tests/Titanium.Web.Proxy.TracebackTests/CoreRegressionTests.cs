@@ -367,11 +367,13 @@ public sealed class CoreRegressionTests
     [Fact]
     public async Task PortConflictDoesNotRegisterEndpointAndCanBeRetried()
     {
-        using var first = new ProxyServer(false, false, false);
+        // Linux permits cooperating listeners when socket reuse is enabled. This case
+        // deliberately requests exclusive listeners so it exercises an actual bind failure.
+        using var first = new ProxyServer(false, false, false) { ReuseSocket = false };
         var held = new ExplicitProxyEndPoint(IPAddress.Loopback, 0, false);
         first.AddEndPoint(held);
         first.Start();
-        using var second = new ProxyServer(false, false, false);
+        using var second = new ProxyServer(false, false, false) { ReuseSocket = false };
         second.AddEndPoint(new ExplicitProxyEndPoint(IPAddress.Loopback, 0, false));
         second.Start();
         try
