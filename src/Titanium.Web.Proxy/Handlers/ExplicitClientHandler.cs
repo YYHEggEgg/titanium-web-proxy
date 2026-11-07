@@ -293,6 +293,19 @@ public partial class ProxyServer
                     X509Certificate2? certificate = null;
                     SslStream? sslStream = null;
 
+                    // CONNECT may name a shared-IP alias while TLS authenticates a different DNS host.
+                    // Keep speculative CONNECT-time generation, but select the leaf by ClientHello SNI.
+                    var serverName = clientHelloInfo.GetServerName();
+                    if (endPoint.GenericCertificate == null && Uri.CheckHostName(serverName) == UriHostNameType.Dns)
+                    {
+                        var sniCertificateName = HttpHelper.GetWildCardDomainName(serverName!,
+                            CertificateManager.DisableWildCardCertificates);
+                        var connectCertificateName = HttpHelper.GetWildCardDomainName(connectHostname,
+                            CertificateManager.DisableWildCardCertificates);
+                        if (!string.Equals(sniCertificateName, connectCertificateName, StringComparison.OrdinalIgnoreCase))
+                            certGenerationTask = CertificateManager.CreateServerCertificate(sniCertificateName);
+                    }
+
                     certificate = await (certGenerationTask
                                       ?? throw new InvalidOperationException(
                                           $"Certificate generation was not started for '{connectHostname}'."))
