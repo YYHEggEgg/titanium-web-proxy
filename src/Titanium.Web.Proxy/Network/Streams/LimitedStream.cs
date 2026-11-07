@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.IO;
 using System.Threading;
 using System.Threading.Tasks;
@@ -14,6 +14,7 @@ internal class LimitedStream : Stream
     private readonly IHttpStreamReader baseReader;
     private readonly IBufferPool bufferPool;
     private readonly bool isChunked;
+    private readonly bool closeDelimited;
     private readonly HeaderCollection? trailingHeaders;
     private readonly int maxTrailerHeaderCount;
     private readonly int maxTrailerHeaderBlockBytes;
@@ -37,6 +38,7 @@ internal class LimitedStream : Stream
         baseReader = baseStream;
         this.bufferPool = bufferPool;
         this.isChunked = isChunked;
+        closeDelimited = !isChunked && contentLength < 0;
         this.trailingHeaders = trailingHeaders;
         this.maxTrailerHeaderCount = maxTrailerHeaderCount;
         this.maxTrailerHeaderBlockBytes = maxTrailerHeaderBlockBytes;
@@ -60,29 +62,23 @@ internal class LimitedStream : Stream
         set => throw new NotSupportedException();
     }
 
-    private async Task GetNextChunkAsync()
+    private async Task GetNextChunkAsync(CancellationToken cancellationToken)
     {
         if (readChunkTrail)
         {
             // read the chunk trail of the previous chunk
-            var s = await baseReader.ReadLineAsync();
-            if (s == null)
-            {
-                bytesRemaining = -1;
-                return;
-            }
+            var s = await baseReader.ReadLineAsync(cancellationToken);
+            cancellationToken.ThrowIfCancellationRequested();
+            if (s != string.Empty)
+                throw new ProxyHttpException("Missing CRLF after chunk payload.", null, null);
         }
 
         readChunkTrail = true;
 
-        var chunkHead = await baseReader.ReadLineAsync();
-        // null = EOF; empty = blank line (half-closed / framing glitch). Either way there is no
-        // more chunk payload — treat as end rather than PROTOCOL_ERROR via Invalid chunk length: ''.
+        var chunkHead = await baseReader.ReadLineAsync(cancellationToken);
+        cancellationToken.ThrowIfCancellationRequested();
         if (string.IsNullOrEmpty(chunkHead))
-        {
-            bytesRemaining = -1;
-            return;
-        }
+            throw new ProxyHttpException("Chunked body ended before its terminating chunk.", null, null);
 
         if (!ChunkSizeParser.TryParse(chunkHead, ProxyLimits.DefaultMaxChunkSizeBytes, out var chunkSize))
             throw new ProxyHttpException($"Invalid chunk length: '{chunkHead}'", null, null);
@@ -97,7 +93,7 @@ internal class LimitedStream : Stream
             // reading only a single line here (as before) left any additional trailer lines unread on the
             // source, corrupting a pooled keep-alive connection's next message.
             await ChunkedTrailerHelper.ReadTrailingHeaders(baseReader, trailingHeaders ?? new HeaderCollection(),
-                null, default, maxTrailerHeaderCount, maxTrailerHeaderBlockBytes);
+                null, cancellationToken, maxTrailerHeaderCount, maxTrailerHeaderBlockBytes);
         }
     }
 
@@ -129,12 +125,13 @@ internal class LimitedStream : Stream
     public override async ValueTask<int> ReadAsync(Memory<byte> buffer,
         CancellationToken cancellationToken = default)
     {
-        if (bytesRemaining == -1) return 0;
+        cancellationToken.ThrowIfCancellationRequested();
+        if (buffer.IsEmpty || bytesRemaining == -1) return 0;
 
         if (bytesRemaining == 0)
         {
             if (isChunked)
-                await GetNextChunkAsync();
+                await GetNextChunkAsync(cancellationToken);
             else
                 bytesRemaining = -1;
         }
@@ -169,17 +166,24 @@ internal class LimitedStream : Stream
 
         bytesRemaining -= res;
 
-        if (res == 0) bytesRemaining = -1;
+        if (res == 0)
+        {
+            cancellationToken.ThrowIfCancellationRequested();
+            if (baseReader is Helpers.HttpStream httpStream) httpStream.ThrowIfTransportFailed();
+            if (!closeDelimited)
+                throw new ProxyHttpException("Body ended before its declared framing boundary.", null, null);
+            bytesRemaining = -1;
+        }
 
         return res;
     }
 
-    public async Task Finish()
+    public async Task Finish(CancellationToken cancellationToken = default)
     {
         // Exact Content-Length drain leaves bytesRemaining == 0; nothing left to syphon.
         // The previous unconditional loop rented an 8 KiB buffer and issued a dummy read —
         // a per-response tax on every tiny-GET MITM / bridge path.
-        if (bytesRemaining is -1 or 0)
+        if (bytesRemaining == -1 || (!isChunked && bytesRemaining == 0))
             return;
 
         // Drain any unread framing bytes so the underlying keep-alive connection stays aligned.
@@ -190,7 +194,7 @@ internal class LimitedStream : Stream
         {
             while (bytesRemaining != -1)
             {
-                var res = await ReadAsync(buffer.AsMemory(), CancellationToken.None);
+                var res = await ReadAsync(buffer.AsMemory(), cancellationToken);
                 if (res == 0) break;
             }
         }

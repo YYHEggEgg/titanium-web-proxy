@@ -31,7 +31,7 @@ public sealed class CoreRegressionTests
     internal static X509Certificate2 Certificate(bool root)
     {
         using var key = RSA.Create(2048);
-        var request = new CertificateRequest(root ? "CN=Isolated test root" : "CN=127.0.0.1", key,
+        var request = new CertificateRequest(root ? $"CN=Isolated test root {Guid.NewGuid():N}" : "CN=127.0.0.1", key,
             HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1);
         request.CertificateExtensions.Add(new X509BasicConstraintsExtension(root, false, 0, true));
         if (!root)
@@ -235,6 +235,128 @@ public sealed class CoreRegressionTests
         internal MemoryStream Response { get; } = new();
         internal int RequestEnds;
         internal int ResponseEnds;
+    }
+
+    [Fact]
+    public async Task ResetOfSmallH2BodyPreservesHeadersPrefixAndHealthySibling()
+    {
+        using var root = Certificate(true);
+        using var certificate = Certificate(false);
+        var reset = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var after = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+        var prefix = Enumerable.Repeat((byte)0x6d, 8193).ToArray();
+        var builder = WebApplication.CreateSlimBuilder();
+        builder.Logging.ClearProviders();
+        builder.WebHost.ConfigureKestrel(options => options.Listen(IPAddress.Loopback, 0, listener =>
+        {
+            listener.Protocols = HttpProtocols.Http2;
+            listener.UseHttps(certificate);
+        }));
+        await using var origin = builder.Build();
+        origin.Run(async context =>
+        {
+            if (context.Request.Path != "/reset") { await context.Response.WriteAsync("healthy"); return; }
+            context.Response.StatusCode = 206;
+            context.Response.ContentLength = 65_536;
+            await context.Response.Body.WriteAsync(prefix, context.RequestAborted);
+            await context.Response.Body.FlushAsync(context.RequestAborted);
+            await reset.Task.WaitAsync(TimeSpan.FromSeconds(15), context.RequestAborted);
+            context.Features.Get<Microsoft.AspNetCore.Http.Features.IHttpResetFeature>()!.Reset(8);
+        });
+        await origin.StartAsync(Token);
+        using var proxy = Proxy(root);
+        proxy.ServerCertificateValidationCallback += (_, args) =>
+        {
+            args.IsValid = args.Certificate?.GetCertHashString() == certificate.Thumbprint;
+            return Task.CompletedTask;
+        };
+        var endpoint = new ExplicitProxyEndPoint(IPAddress.Loopback, 0, true);
+        endpoint.BeforeTunnelConnectRequest += (_, args) =>
+        {
+            args.UpstreamHttpProtocol = UpstreamHttpProtocol.Http2;
+            args.AllowHttpProtocolTranslation = true;
+            return Task.CompletedTask;
+        };
+        using var observed = new MemoryStream();
+        var ends = 0;
+        Exception? terminalError = null;
+        proxy.OnResponseBodyWrite += (_, args) =>
+        {
+            if (args.Session.HttpClient.Request.RequestUri.AbsolutePath == "/reset")
+            {
+                observed.Write(args.BodyBytes);
+                if (args.IsLastChunk) ends++;
+            }
+            return Task.CompletedTask;
+        };
+        proxy.AfterResponse += (_, args) =>
+        {
+            if (args.HttpClient.Request.RequestUri.AbsolutePath == "/reset")
+            {
+                terminalError = args.Exception;
+                after.TrySetResult();
+            }
+            return Task.CompletedTask;
+        };
+        proxy.AddEndPoint(endpoint);
+        proxy.Start();
+        try
+        {
+            using var client = new HttpClient(new SocketsHttpHandler
+            {
+                Proxy = new WebProxy($"http://127.0.0.1:{endpoint.Port}"),
+                SslOptions = new SslClientAuthenticationOptions { RemoteCertificateValidationCallback = (_, _, _, _) => true }
+            }) { Timeout = TimeSpan.FromSeconds(15) };
+            using var response = await client.GetAsync(origin.Urls.Single() + "/reset", HttpCompletionOption.ResponseHeadersRead, Token)
+                .WaitAsync(TimeSpan.FromSeconds(5), Token);
+            Assert.Equal(HttpStatusCode.PartialContent, response.StatusCode);
+            using var body = await response.Content.ReadAsStreamAsync(Token);
+            var delivered = new byte[prefix.Length];
+            await body.ReadExactlyAsync(delivered, Token).AsTask().WaitAsync(TimeSpan.FromSeconds(5), Token);
+            Assert.Equal(prefix, delivered);
+            Assert.Equal("healthy", await client.GetStringAsync(origin.Urls.Single() + "/healthy", Token));
+            reset.TrySetResult();
+            var failure = await Record.ExceptionAsync(async () => await body.CopyToAsync(Stream.Null, Token).WaitAsync(TimeSpan.FromSeconds(5), Token));
+            Assert.NotNull(failure);
+            Assert.IsNotType<TimeoutException>(failure);
+            await after.Task.WaitAsync(TimeSpan.FromSeconds(5), Token);
+            Assert.NotNull(terminalError);
+            Assert.Equal(prefix, observed.ToArray());
+            Assert.Equal(0, ends);
+        }
+        finally
+        {
+            reset.TrySetResult();
+            await proxy.StopAsync(TimeSpan.FromSeconds(5));
+            await origin.StopAsync(Token);
+        }
+    }
+
+    [Fact]
+    public async Task PortConflictDoesNotRegisterEndpointAndCanBeRetried()
+    {
+        using var first = new ProxyServer(false, false, false);
+        var held = new ExplicitProxyEndPoint(IPAddress.Loopback, 0, false);
+        first.AddEndPoint(held);
+        first.Start();
+        using var second = new ProxyServer(false, false, false);
+        second.AddEndPoint(new ExplicitProxyEndPoint(IPAddress.Loopback, 0, false));
+        second.Start();
+        try
+        {
+            var failed = new ExplicitProxyEndPoint(IPAddress.Loopback, held.Port, false);
+            var error = Assert.Throws<Exceptions.ProxyListenException>(() => second.AddEndPoint(failed));
+            Assert.True(error.IsAddressInUse);
+            Assert.DoesNotContain(failed, second.ProxyEndPoints);
+            await first.StopAsync(TimeSpan.FromSeconds(5));
+            second.AddEndPoint(failed);
+            Assert.Contains(failed, second.ProxyEndPoints);
+        }
+        finally
+        {
+            if (first.ProxyRunning) await first.StopAsync(TimeSpan.FromSeconds(5));
+            await second.StopAsync(TimeSpan.FromSeconds(5));
+        }
     }
 
     private sealed class UnknownLengthContent(byte[] bytes) : HttpContent

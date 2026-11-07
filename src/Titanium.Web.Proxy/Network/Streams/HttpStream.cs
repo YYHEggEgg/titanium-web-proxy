@@ -35,6 +35,7 @@ internal partial class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader
     private bool disposed;
 
     private bool closedWrite;
+    private Exception? transportFailure;
 
     private readonly IBufferPool bufferPool;
     private readonly CancellationToken cancellationToken;
@@ -129,8 +130,9 @@ internal partial class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader
     ///     class has no owning <see cref="ProxyServer" /> reference to source a live logger from, so it
     ///     always reports through the process-wide fallback gateway logger.
     /// </summary>
-    private static void ReportSuppressedFailure(Exception ex)
+    private void ReportSuppressedFailure(Exception ex)
     {
+        transportFailure ??= ex;
         ProxyDiagnostics.ReportExpected(ProxyDiagnostics.Logger,"Suppressed a network stream read/write failure (expected when the remote endpoint closed or reset the connection).",
             ex);
     }
@@ -140,6 +142,12 @@ internal partial class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader
     ///     memory streams where an IO error is unexpected). Returns <paramref name="ex" /> so callers
     ///     can <c>throw ReportRethrownFailure(ex)</c> without an extra local.
     /// </summary>
+    internal void ThrowIfTransportFailed()
+    {
+        if (transportFailure is not null)
+            throw new IOException("The transport failed while reading the message body.", transportFailure);
+    }
+
     private static Exception ReportRethrownFailure(Exception ex)
     {
         ProxyDiagnostics.ReportCaught(ProxyDiagnostics.Logger,

@@ -582,7 +582,7 @@ public partial class ProxyServer
                                 await writeData(await ObservedBodyWriteStream.ObserveAsync(args, true, bytes, false), ct);
                             else await writeData(bytes, ct);
                         }
-                        await limited.Finish();
+                        await limited.Finish(ct);
                         if (HasOnRequestBodyWriteSubscribers && !args.IsFastPath)
                         {
                             var final = await ObservedBodyWriteStream.ObserveAsync(args, true, ReadOnlyMemory<byte>.Empty, true);
@@ -669,7 +669,7 @@ public partial class ProxyServer
                 try
                 {
                     exchange = await originConnection.SendAsync(request, relayInterim, cancellationToken,
-                        copyRequestBody, perTryLimit);
+                        copyRequestBody, perTryLimit, streamResponseBody: HasOnResponseBodyWriteSubscribers && !args.IsFastPath);
                 }
                 catch (Http2OriginGoAwayException)
                 {
@@ -691,7 +691,7 @@ public partial class ProxyServer
 
                     args.Timing?.MarkRequestSent();
                     exchange = await originConnection.SendAsync(request, relayInterim, cancellationToken, null,
-                        perTryLimit);
+                        perTryLimit, streamResponseBody: HasOnResponseBodyWriteSubscribers && !args.IsFastPath);
                 }
             }
             catch (ProxyTimeoutException ex) when (ex.Kind == ProxyTimeoutKind.ResponseHeader
@@ -723,8 +723,9 @@ public partial class ProxyServer
             if (args.HttpClient.CloseServerConnection)
                 Http2OriginConnectionPool.Invalidate(poolKey, originConnection);
         }
-        catch (Exception ex) when (!(ex is ProxyHttpException))
+        catch (Exception ex)
         {
+            args.Exception ??= ex;
             if (!cancellationToken.IsCancellationRequested)
             {
                 ProxyDiagnostics.ReportException(logger, "HTTP/1.1-to-HTTP/2 bridge origin exchange failed",
@@ -736,6 +737,9 @@ public partial class ProxyServer
                 OriginFailureResponses.Apply(args, ex);
                 await args.ClientStream.WriteResponseAsync(args.HttpClient.Response, cancellationToken);
             }
+            else
+                args.ClientConnection.Abort();
+            throw;
         }
     }
 
@@ -784,7 +788,8 @@ public partial class ProxyServer
                 var limit = PerTryHeaderTimeout(args, false);
                 try
                 {
-                    exchange = await originConnection.SendAsync(request, relayInterim, cancellationToken, null, limit);
+                    exchange = await originConnection.SendAsync(request, relayInterim, cancellationToken, null, limit,
+                        streamResponseBody: HasOnResponseBodyWriteSubscribers && !args.IsFastPath);
                 }
                 catch (ProxyTimeoutException ex) when (ex.Kind == ProxyTimeoutKind.ResponseHeader
                                                        && limit.HasValue)

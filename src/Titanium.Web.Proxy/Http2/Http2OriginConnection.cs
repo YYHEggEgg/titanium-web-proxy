@@ -345,7 +345,7 @@ internal sealed class Http2OriginConnection : IDisposable
         CancellationToken cancellationToken,
         Func<Func<ReadOnlyMemory<byte>, CancellationToken, ValueTask>, CancellationToken, Task>? copyRequestBody =
             null,
-        TimeSpan? headerTimeout = null)
+        TimeSpan? headerTimeout = null, bool streamResponseBody = false)
     {
         if (!IsUsable) throw new Http2OriginGoAwayException("The origin h2 connection is no longer usable.");
 
@@ -363,7 +363,10 @@ internal sealed class Http2OriginConnection : IDisposable
 
         // Allocate InterimChannel only when the caller will drain 1xx (on1xx != null). Passthrough
         // bridges wait on HeadersReceived instead — avoids per-request Channel/segment Gen0.
-        var pending = new PendingStream(createInterimChannel: on1xx != null);
+        var pending = new PendingStream(createInterimChannel: on1xx != null)
+        {
+            StreamResponseBody = streamResponseBody
+        };
         var streamId = 0;
         var streamOpened = false;
         var bodyHandedOff = false;
@@ -544,7 +547,7 @@ internal sealed class Http2OriginConnection : IDisposable
             // A small gRPC body is complete before the status trailers behind it have arrived, and a buffered
             // exchange unregisters the stream on return, which would drop them. Wait for END_STREAM first.
             // Larger and unknown-length bodies are streamed and read their trailers late instead.
-            if (!pending.IsInboundComplete && !pending.IsTunnel && request.Method != "HEAD"
+            if (!streamResponseBody && !pending.IsInboundComplete && !pending.IsTunnel && request.Method != "HEAD"
                 && response.ContentLength is >= 0 and <= PendingStream.InlineBodyThresholdBytes
                 && Grpc.GrpcWebAdapter.IsNativeGrpc(response.ContentType))
             {
@@ -605,7 +608,7 @@ internal sealed class Http2OriginConnection : IDisposable
             // Known-CL bodies that exceeded the inline threshold still buffer then return so H1
             // deliver can coalesce headers+body. Streaming via StreamBodyWriter pays an extra
             // pipe+async hop per request for these.
-            if (response.ContentLength is >= 0 and <= PendingStream.InlineBodyThresholdBytes)
+            if (!streamResponseBody && response.ContentLength is >= 0 and <= PendingStream.InlineBodyThresholdBytes)
             {
                 var expected = (int)response.ContentLength;
                 byte[] body;
@@ -619,12 +622,7 @@ internal sealed class Http2OriginConnection : IDisposable
                     body = new byte[expected];
                     var read = await bodyPipe.ReadExactAsync(body, cancellationToken).ConfigureAwait(false);
                     if (read != expected)
-                    {
-                        if (read == 0)
-                            body = Array.Empty<byte>();
-                        else
-                            Array.Resize(ref body, read);
-                    }
+                        throw new IOException($"HTTP/2 response ended after {read} of {expected} declared bytes.");
                 }
 
                 response.IsBodyRead = true;
@@ -2099,9 +2097,11 @@ internal sealed class Http2OriginConnection : IDisposable
         ///     When Content-Length is known and ≤ <see cref="InlineBodyThresholdBytes"/>, allocate a
         ///     single body buffer for the ReadLoop. Returns true when inline mode is active.
         /// </summary>
+        internal bool StreamResponseBody { get; init; }
+
         internal bool TryPrepareInlineBody(Response response)
         {
-            if (IsTunnel || response.ContentLength is < 0 or > InlineBodyThresholdBytes)
+            if (StreamResponseBody || IsTunnel || response.ContentLength is < 0 or > InlineBodyThresholdBytes)
                 return false;
 
             var expected = (int)response.ContentLength;
@@ -2118,18 +2118,15 @@ internal sealed class Http2OriginConnection : IDisposable
             var toCopy = Math.Min(space, data.Length);
             data.Slice(0, toCopy).CopyTo(inlineBody.AsSpan(inlineWritten));
             inlineWritten += toCopy;
-            // Full buffer: unblock SendAsync even if END_STREAM is slightly delayed.
-            if (inlineWritten >= inlineBody.Length)
-                HeadersReceived.TrySetResult(true);
+            // Content-Length alone does not complete an H2 message. Wait for END_STREAM so
+            // a following reset cannot turn an interrupted exchange into a successful response.
         }
 
         internal byte[] TakeInlineBody()
         {
             var body = inlineBody ?? Array.Empty<byte>();
-            if (inlineWritten > 0 && inlineWritten < body.Length)
-                Array.Resize(ref body, inlineWritten);
-            else if (inlineWritten == 0 && body.Length > 0)
-                body = Array.Empty<byte>();
+            if (inlineWritten != body.Length)
+                throw new IOException($"HTTP/2 response ended after {inlineWritten} of {body.Length} declared bytes.");
             inlineBody = null;
             return body;
         }

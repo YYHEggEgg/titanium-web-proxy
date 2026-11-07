@@ -351,10 +351,10 @@ namespace Titanium.Web.Proxy.Http2
                 // connection tears down never got a response, so record that as Exception before finalizing.
                 if (leftover.SessionArgs is { } leftoverArgs
                     && leftoverArgs.Exception == null
-                    && !leftoverArgs.HttpClient.Response.Locked)
+                    && !leftover.IsClosed)
                 {
                     leftoverArgs.Exception = new OperationCanceledException(
-                        "The HTTP/2 connection was closed before this stream received a response.");
+                        "The HTTP/2 connection closed before this exchange completed.");
                 }
 
                 ScheduleFinalize(leftover, onAfterResponse, logger, connectionState);

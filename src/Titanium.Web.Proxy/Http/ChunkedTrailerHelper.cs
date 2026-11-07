@@ -68,7 +68,10 @@ internal static class ChunkedTrailerHelper
         while (true)
         {
             var line = await reader.ReadLineAsync(cancellationToken);
-            if (string.IsNullOrEmpty(line)) break;
+            cancellationToken.ThrowIfCancellationRequested();
+            if (line == null)
+                throw new ProxyHttpException("Chunked trailers ended before the terminating blank line.", null, null);
+            if (line.Length == 0) break;
             count++;
             if (count > maxTrailerHeaderCount)
             {

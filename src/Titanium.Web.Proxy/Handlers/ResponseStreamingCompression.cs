@@ -83,7 +83,7 @@ public partial class ProxyServer
 
             if (completed)
             {
-                await origin.Finish().ConfigureAwait(false);
+                await origin.Finish(cancellationToken).ConfigureAwait(false);
                 return true;
             }
 

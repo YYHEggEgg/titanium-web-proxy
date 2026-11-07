@@ -253,6 +253,7 @@ public partial class ProxyServer
         streamState.IsExternalBridge = true;
         streamState.InboundRequestBodyChannel = requestBodyChannel;
 
+
         // IsFastPath: no ContinueWith fault wrapper (catch inside the round trip already reports).
         // Saves one Task + continuation alloc per multiplexed GET under H2→H1 MITM.
         Task bridgeTask;
@@ -589,6 +590,7 @@ public partial class ProxyServer
                                 if (HasOnRequestBodyWriteSubscribers && !sessionArgs.IsFastPath)
                                     await bodyWriter.WriteAsync(await ObservedBodyWriteStream.ObserveAsync(sessionArgs, true, bodyPiece, false), cancellationToken);
                                 else await bodyWriter.WriteAsync(bodyPiece, cancellationToken);
+
                             }
                         }
                         finally
@@ -865,26 +867,15 @@ public partial class ProxyServer
                         var buffer = BufferPool.GetBuffer(frameBytes);
                         try
                         {
-                            var filled = 0;
                             while (true)
                             {
-                                var read = await limited.ReadAsync(buffer.AsMemory(filled, frameBytes - filled), ct);
-                                if (read == 0)
-                                {
-                                    if (filled > 0)
-                                        await clientBodyStream.WriteAsync(buffer.AsMemory(0, filled), ct);
-                                    break;
-                                }
-
-                                filled += read;
-                                if (filled == frameBytes)
-                                {
-                                    await clientBodyStream.WriteAsync(buffer.AsMemory(0, filled), ct);
-                                    filled = 0;
-                                }
+                                var read = await limited.ReadAsync(buffer.AsMemory(0, frameBytes), ct);
+                                if (read == 0) break;
+                                // Deliver every successful read before a later failure can discard it.
+                                await clientBodyStream.WriteAsync(buffer.AsMemory(0, read), ct);
                             }
 
-                            await limited.Finish();
+                            await limited.Finish(ct);
                             if (observed != null) await observed.CompleteAsync(ct);
                         }
                         finally
@@ -953,6 +944,7 @@ public partial class ProxyServer
         catch (Exception ex)
         {
             closeConnection = true;
+            sessionArgs.Exception ??= ex;
 
             // A stream/connection cancellation (RST_STREAM, GOAWAY, or the client connection itself ending)
             // is an expected teardown path, not a bug - and the client is not waiting for an error response

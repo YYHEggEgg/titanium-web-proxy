@@ -81,7 +81,7 @@ internal partial class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader
                 for (var i = decompressLayers.Count - 1; i >= 0; i--)
                     await decompressLayers[i].DisposeAsync();
 
-            await limitedStream.Finish();
+            await limitedStream.Finish(cancellationToken);
             await limitedStream.DisposeAsync();
         }
     }
@@ -242,7 +242,8 @@ internal partial class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader
                 while (true)
                 {
                     var chunkHead = await ReadLineAsync(cancellationToken);
-                    if (chunkHead == null) break;
+                    if (chunkHead == null)
+                        throw new ProxyHttpException("Chunked body ended before its terminating chunk.", null, args);
 
                     if (!ChunkSizeParser.TryParse(chunkHead, ProxyLimits.DefaultMaxChunkSizeBytes, out var chunkSize))
                         throw new ProxyHttpException($"Invalid chunk length: '{chunkHead}'", null, null);
@@ -305,7 +306,24 @@ internal partial class HttpStream : Stream, IHttpStreamWriter, IHttpStreamReader
                 {
                     var toRead = (int)Math.Min(buffer.Length, remaining);
                     var bytesRead = await ReadAsync(buffer.AsMemory(0, toRead), cancellationToken);
-                    if (bytesRead == 0) break;
+                    if (bytesRead == 0)
+                    {
+                        cancellationToken.ThrowIfCancellationRequested();
+                        if (transportFailure is not null)
+                        {
+                            // A clean close-delimited FIN would hide a reset from an H1 downstream.
+                            if (!isRequest && originalContentLength < 0
+                                && !args.ClientConnection.Http2CleartextClient
+                                && (args.ClientConnection.NegotiatedApplicationProtocol == default
+                                    || args.ClientConnection.NegotiatedApplicationProtocol == System.Net.Security.SslApplicationProtocol.Http11))
+                                args.ClientConnection.Abort();
+                            throw new ProxyHttpException("The transport failed before the body completed.", transportFailure, args);
+                        }
+                        if (originalContentLength >= 0)
+                            throw new ProxyHttpException("Body ended before its declared Content-Length.", null, args);
+                        await emit(Array.Empty<byte>(), true);
+                        break;
+                    }
 
                     remaining -= bytesRead;
 

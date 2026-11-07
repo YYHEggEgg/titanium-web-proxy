@@ -112,6 +112,16 @@ internal class TcpClientConnection : IDisposable
         GC.SuppressFinalize(this);
     }
 
+    internal void Abort()
+    {
+        if (Interlocked.Exchange(ref disposed, 1) != 0) return;
+        ClientCertificate?.Dispose();
+        ClientCertificate = null;
+        if (trackClientConnectionCount) ProxyServer.UpdateClientConnectionCount(false);
+        // Abort before an owning stream's Dispose can turn the failure into an orderly FIN.
+        CloseClientSocket(lingerSeconds: 0);
+    }
+
     protected virtual void Dispose(bool disposing) // NOSONAR S3776 -- This protocol/state-machine path shares mutable parsing or transport state; splitting it further would create disproportionate regression risk.
     {
         if (Interlocked.Exchange(ref disposed, 1) != 0) return;

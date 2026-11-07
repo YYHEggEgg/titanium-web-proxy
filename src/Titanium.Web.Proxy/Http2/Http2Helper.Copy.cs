@@ -2442,12 +2442,12 @@ namespace Titanium.Web.Proxy.Http2
                         // an actual proxy failure, instead of seeing an unexplained zero-status entry.
                         if (resetStream.SessionArgs is { } resetArgs
                             && resetArgs.Exception == null
-                            && !resetArgs.HttpClient.Response.Locked)
+                            && !resetStream.IsClosed)
                         {
                             resetArgs.Exception = new OperationCanceledException(
                                 isClient
-                                    ? "Stream was reset by the client before it received a response."
-                                    : "Stream was reset by the origin before it received a response.");
+                                    ? "Stream was reset by the client before the exchange completed."
+                                    : "Stream was reset by the origin before the exchange completed.");
                         }
 
                         ScheduleFinalize(resetStream, onAfterResponse, logger, connectionState);

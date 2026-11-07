@@ -285,7 +285,7 @@ internal static partial class Http3OriginBridge
                                 }
                             }
 
-                            await limited.Finish();
+                            await limited.Finish(ct);
                         }
                         finally
                         {
@@ -717,7 +717,7 @@ internal static partial class Http3OriginBridge
                             int read;
                             while ((read = await limited.ReadAsync(buffer.AsMemory(), ct)) > 0)
                                 await clientBodyStream.WriteAsync(buffer.AsMemory(0, read), ct);
-                            await limited.Finish();
+                            await limited.Finish(ct);
                         }
                         finally
                         {
