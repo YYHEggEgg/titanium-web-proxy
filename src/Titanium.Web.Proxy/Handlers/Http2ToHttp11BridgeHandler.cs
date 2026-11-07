@@ -585,8 +585,10 @@ public partial class ProxyServer
                             if (chunk.Length > 0)
                             {
                                 written += chunk.Length;
-                                await bodyWriter.WriteAsync(chunk.Buffer.AsMemory(0, chunk.Length),
-                                    cancellationToken);
+                                var bodyPiece = chunk.Buffer.AsMemory(0, chunk.Length);
+                                if (HasOnRequestBodyWriteSubscribers && !sessionArgs.IsFastPath)
+                                    await bodyWriter.WriteAsync(await ObservedBodyWriteStream.ObserveAsync(sessionArgs, true, bodyPiece, false), cancellationToken);
+                                else await bodyWriter.WriteAsync(bodyPiece, cancellationToken);
                             }
                         }
                         finally
@@ -607,12 +609,19 @@ public partial class ProxyServer
                             null, sessionArgs);
                     }
 
+                    if (HasOnRequestBodyWriteSubscribers && !sessionArgs.IsFastPath)
+                    {
+                        var final = await ObservedBodyWriteStream.ObserveAsync(sessionArgs, true, ReadOnlyMemory<byte>.Empty, true);
+                        if (final.Length > 0) await bodyWriter.WriteAsync(final, cancellationToken);
+                    }
                     await bodyWriter.CompleteAsync(
                         request.HasTrailingHeaders ? request.TrailingHeaders : null, cancellationToken);
                     request.IsBodyReceived = true;
                 }
                 else
                 {
+                    if (HasOnRequestBodyWriteSubscribers && !sessionArgs.IsFastPath && body != null)
+                        body = await ObservedBodyWriteStream.ObserveAsync(sessionArgs, true, body, true);
                     await connection.Stream.WriteBodyAsync(body ?? Array.Empty<byte>(), request.IsChunked,
                         request.HasTrailingHeaders ? request.TrailingHeaders : null, cancellationToken);
                 }
@@ -724,6 +733,7 @@ public partial class ProxyServer
                 var eagerBodyThreshold = EagerBufferBodyThreshold(
                     sessionArgs.MaxBufferedBodyBytes ?? MaxBufferedBodyBytes);
                 if (originHasBody && !response.IsBodyRead
+                    && !(HasOnResponseBodyWriteSubscribers && !sessionArgs.IsFastPath)
                     && streamingCompression is null
                     && !originIsChunked
                     && originContentLength >= 0
@@ -805,12 +815,19 @@ public partial class ProxyServer
 
                     response.StreamBodyWriter = async (clientBodyStream, ct) =>
                     {
+                        ObservedBodyWriteStream? observed = null;
+                        if (HasOnResponseBodyWriteSubscribers && !sessionArgs.IsFastPath)
+                        {
+                            observed = new ObservedBodyWriteStream(clientBodyStream, sessionArgs, false);
+                            clientBodyStream = observed;
+                        }
                         // Streaming compression: the response headers were rewritten above; compress each
                         // origin read into DATA frames. The emitter ends the stream afterwards.
                         if (streamingCompression is { } compressionPlan && CompressionPolicy is { } compressionPolicy)
                         {
                             await RelayCompressedBodyAsync(sessionArgs, compressionPolicy, compressionPlan,
                                 clientBodyStream, null, ct).ConfigureAwait(false);
+                            if (observed != null) await observed.CompleteAsync(ct);
                             return;
                         }
 
@@ -868,6 +885,7 @@ public partial class ProxyServer
                             }
 
                             await limited.Finish();
+                            if (observed != null) await observed.CompleteAsync(ct);
                         }
                         finally
                         {
@@ -889,6 +907,8 @@ public partial class ProxyServer
                     // report the origin protocol (H2↔H1.1), not H2↔H2.
                     // Preserve BodyIsWireEncoded across Body reassignment (setter clears the flag).
                     var wasWireEncoded = response.BodyIsWireEncoded;
+                    if (HasOnResponseBodyWriteSubscribers && !sessionArgs.IsFastPath)
+                        bodyBytes = await ObservedBodyWriteStream.ObserveAsync(sessionArgs, false, bodyBytes, true);
                     response.HttpVersion = clientHttpVersion;
                     response.Body = bodyBytes;
                     if (wasWireEncoded)

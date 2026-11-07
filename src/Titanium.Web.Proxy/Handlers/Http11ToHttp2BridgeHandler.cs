@@ -576,8 +576,18 @@ public partial class ProxyServer
                     {
                         int read;
                         while ((read = await limited.ReadAsync(buffer.AsMemory(), ct)) > 0)
-                            await writeData(buffer.AsMemory(0, read), ct);
+                        {
+                            var bytes = buffer.AsMemory(0, read);
+                            if (HasOnRequestBodyWriteSubscribers && !args.IsFastPath)
+                                await writeData(await ObservedBodyWriteStream.ObserveAsync(args, true, bytes, false), ct);
+                            else await writeData(bytes, ct);
+                        }
                         await limited.Finish();
+                        if (HasOnRequestBodyWriteSubscribers && !args.IsFastPath)
+                        {
+                            var final = await ObservedBodyWriteStream.ObserveAsync(args, true, ReadOnlyMemory<byte>.Empty, true);
+                            if (final.Length > 0) await writeData(final, ct);
+                        }
                         request.IsBodyReceived = true;
                     }
                     finally
@@ -890,6 +900,12 @@ public partial class ProxyServer
         // Http1FramingValidator's remarks. The call is still made (as a documented no-op) so this
         // remains one of the five insertion points the isolation test suite enumerates, rather than a
         // silently-uncovered SetOriginalHeaders() call site.
+        // END_STREAM bounds an unknown-length H2 body; give H1 observers valid framing first.
+        if (response.StreamBodyWriter != null && response.ContentLength < 0)
+        {
+            if (!ClientCannotReceiveChunked(args)) response.IsChunked = true;
+            else response.Headers.AddHeader(KnownHeaders.Connection, "close");
+        }
         Http1FramingValidator.Validate(response, FramingSource.SynthesizedFromH2);
         response.SetOriginalHeaders();
         args.HttpClient.Response = response;
@@ -948,6 +964,20 @@ public partial class ProxyServer
             response.Headers.NormalizeMessageFraming();
 
         var body = exchange.Body;
+        if (HasOnResponseBodyWriteSubscribers)
+        {
+            if (response.StreamBodyWriter is { } produceBody)
+            {
+                response.StreamBodyWriter = async (target, ct) =>
+                {
+                    var observed = new ObservedBodyWriteStream(target, args, false);
+                    await produceBody(observed, ct);
+                    await observed.CompleteAsync(ct);
+                };
+            }
+            else
+                body = await ObservedBodyWriteStream.ObserveAsync(args, false, body, true);
+        }
 
         // RFC 7540 §8.1.2: h2 field framing carries no HTTP/1.1-style trailers concept of its own, but the
         // decoded trailers must still reach the client somehow - HTTP/1.1 can only convey them as chunked

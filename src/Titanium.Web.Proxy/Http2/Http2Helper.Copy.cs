@@ -2739,6 +2739,19 @@ namespace Titanium.Web.Proxy.Http2
                     }
                 }
 
+                // HEADERS can end an empty body or carry its trailers without a final DATA frame.
+                if (endStream && type != Http2FrameType.Data && rr != null && args != null
+                    && !args.IsFastPath && !rr.IsBodyRead
+                    && (!connectionState.Streams.TryGetValue(streamId, out var observedStream)
+                        || !observedStream.IsExternalBridge))
+                {
+                    var finalBody = new BeforeBodyWriteEventArgs(args, Array.Empty<byte>(), true, true);
+                    if (isClient && args.Server.ShouldCallBeforeRequestBodyWrite())
+                        await args.Server.OnBeforeRequestBodyWrite(finalBody);
+                    else if (!isClient && args.Server.ShouldCallBeforeResponseBodyWrite())
+                        await args.Server.OnBeforeResponseBodyWrite(finalBody);
+                }
+
                 // DATA with END_STREAM may be partially deferred for send-window credit; do not
                 // half-close / finalize until the last byte is actually queued (see sendPacket /
                 // OnDeferredEndStream). Non-DATA END_STREAM (HEADERS) and DATA that is not forwarded
