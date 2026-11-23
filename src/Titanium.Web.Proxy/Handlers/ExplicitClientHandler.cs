@@ -183,14 +183,16 @@ public partial class ProxyServer
                 Task<X509Certificate2?>? certGenerationTask = null;
                 var h3RouteAtConnect = Http3.Http3OriginRoute.None;
 
-                if (decryptSsl && Uri.CheckHostName(connectHostname) != UriHostNameType.IPv4
-                    && Uri.CheckHostName(connectHostname) != UriHostNameType.IPv6)
+                if (decryptSsl)
                 {
-                    certGenerationTask = endPoint.GenericCertificate != null
-                        ? Task.FromResult<X509Certificate2?>(endPoint.GenericCertificate)
-                        : CertificateManager.CreateServerCertificate(
-                            HttpHelper.GetWildCardDomainName(connectHostname,
-                                CertificateManager.DisableWildCardCertificates));
+                    if (Uri.CheckHostName(connectHostname) is not (UriHostNameType.IPv4 or UriHostNameType.IPv6))
+                    {
+                        certGenerationTask = endPoint.GenericCertificate != null
+                            ? Task.FromResult<X509Certificate2?>(endPoint.GenericCertificate)
+                            : CertificateManager.CreateServerCertificate(
+                                HttpHelper.GetWildCardDomainName(connectHostname,
+                                    CertificateManager.DisableWildCardCertificates));
+                    }
 
                     connectTiming?.MarkOriginCapabilityStarted("resolve");
                     h3RouteAtConnect = ResolveHttp3Origin(
