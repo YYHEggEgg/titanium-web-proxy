@@ -297,7 +297,7 @@ public partial class ProxyServer
                     SslStream? sslStream = null;
 
                     // CONNECT may name a shared-IP alias while TLS authenticates a different DNS host.
-                    // Keep speculative CONNECT-time generation, but select the leaf by ClientHello SNI.
+                    // Keep speculative generation for named CONNECT targets, and select the leaf by ClientHello SNI.
                     var serverName = clientHelloInfo.GetServerName();
                     if (endPoint.GenericCertificate == null && Uri.CheckHostName(serverName) == UriHostNameType.Dns)
                     {
