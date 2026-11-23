@@ -183,7 +183,8 @@ public partial class ProxyServer
                 Task<X509Certificate2?>? certGenerationTask = null;
                 var h3RouteAtConnect = Http3.Http3OriginRoute.None;
 
-                if (decryptSsl)
+                if (decryptSsl && Uri.CheckHostName(connectHostname) != UriHostNameType.IPv4
+                    && Uri.CheckHostName(connectHostname) != UriHostNameType.IPv6)
                 {
                     certGenerationTask = endPoint.GenericCertificate != null
                         ? Task.FromResult<X509Certificate2?>(endPoint.GenericCertificate)
@@ -305,6 +306,13 @@ public partial class ProxyServer
                         if (!string.Equals(sniCertificateName, connectCertificateName, StringComparison.OrdinalIgnoreCase))
                             certGenerationTask = CertificateManager.CreateServerCertificate(sniCertificateName);
                     }
+
+                    if (certGenerationTask is null)
+                        certGenerationTask = endPoint.GenericCertificate != null
+                            ? Task.FromResult<X509Certificate2?>(endPoint.GenericCertificate)
+                            : CertificateManager.CreateServerCertificate(
+                                HttpHelper.GetWildCardDomainName(connectHostname,
+                                    CertificateManager.DisableWildCardCertificates));
 
                     certificate = await (certGenerationTask
                                       ?? throw new InvalidOperationException(
